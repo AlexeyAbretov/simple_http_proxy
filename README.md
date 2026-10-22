@@ -31,29 +31,55 @@ Android-приложение, которое отправляет TCP-трафи
 
 ## Сборка
 
-Нужны JDK 17 и Android SDK. В корне создайте `local.properties` со строкой `sdk.dir` на каталог SDK.
+Нужны полный JDK 17 (с `javac`) и Android SDK. Среда выполнения Java из другой программы не подходит: в ней нет компилятора, и Gradle её не видит. Сборка идёт на API 35, на телефон ставится APK для Android 8.0 и новее.
 
-Тесты ядра Android SDK не требуют:
+### Windows
 
-```bat
-gradlew.bat :core:test
+В PowerShell:
+
+```powershell
+winget install EclipseAdoptium.Temurin.17.JDK
+winget install Google.AndroidStudio
 ```
 
-Отладочный APK:
+Закройте терминал и откройте новый, чтобы подхватились `PATH` и `JAVA_HOME`. Проверка: `java -version` показывает 17. Если команда не находится, `JAVA_HOME` должен указывать на каталог JDK, обычно `C:\Program Files\Eclipse Adoptium\jdk-17...`.
 
-```bat
-gradlew.bat :app:assembleDebug
+Запустите Android Studio один раз и дойдите до конца мастера. Он скачает SDK, по умолчанию в `%LOCALAPPDATA%\Android\Sdk`. В SDK Manager должна стоять платформа Android 35.
+
+В корне проекта создайте `local.properties` (файл в git не входит):
+
+```properties
+sdk.dir=C:\\Users\\<пользователь>\\AppData\\Local\\Android\\Sdk
 ```
 
-Файл появляется здесь:
+Подставьте свой каталог SDK. Обратные слэши пишите парами.
+
+Из корня проекта:
+
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
+
+APK:
 
 ```text
-app/build/outputs/apk/debug/simple-http-proxy-<versionName>.apk
+app\build\outputs\apk\debug\simple-http-proxy-<versionName>.apk
 ```
 
-На Linux и macOS те же задачи запускаются через `./gradlew`.
+Тесты ядра SDK не требуют, JDK 17 нужен:
 
-Минимальная версия Android — 8.0 (API 26). Сборка идёт на API 35.
+```powershell
+.\gradlew.bat :core:test
+```
+
+### Linux и macOS
+
+Поставьте JDK 17 и Android SDK, в `local.properties` укажите `sdk.dir` через прямые слэши. Те же задачи запускаются так:
+
+```sh
+./gradlew :app:assembleDebug
+./gradlew :core:test
+```
 
 ## Репозиторий
 
