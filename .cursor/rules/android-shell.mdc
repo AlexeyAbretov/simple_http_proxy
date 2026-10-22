@@ -1,0 +1,19 @@
+---
+description: Оболочка Android VPN
+globs: app/**/*.{kt,java,xml}
+alwaysApply: false
+---
+
+# Оболочка приложения
+
+`HttpVpnService` владеет TUN и жизненным циклом. `TunEngine` сокеты не создаёт: их открывают `TunnelFactory` и `TcpDial` в сервисе.
+
+Каждый сокет к прокси биндится и проходит `protect` или `bindSocket` на сеть без VPN. Если exclude приложения, `protect` и привязка все три не сработали, сокет закрой и верни ошибку.
+
+При включённом обходе LAN маршруты бери из `Routes.publicInternet`, иначе ставь `0.0.0.0/0`. `addDisallowedApplication(packageName)` оставляй.
+
+Экран только редактирует `ProxyConfig` и показывает `VpnRuntime`. Пароль в снимок состояния не клади. Кнопка проверки — `CONNECT` на `example.com:443`, пока VPN выключен.
+
+Тексты для человека — по-русски, в `strings.xml` или в статусе. Строку `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` в манифесте не переводи: это декларация типа службы для системы.
+
+Правка этого каталога поднимает `versionCode` и последнюю часть `versionName` в `app/build.gradle.kts`.
