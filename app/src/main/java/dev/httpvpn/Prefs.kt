@@ -33,5 +33,6 @@ object Prefs {
             .putString("pass", config.password)
             .putBoolean("bypassLan", config.bypassLan)
             .commit()
+        KeptProxy.write(context, config.host, config.port, config.username)
     }
 }

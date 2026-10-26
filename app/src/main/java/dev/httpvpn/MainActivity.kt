@@ -39,20 +39,75 @@ class MainActivity : AppCompatActivity() {
 
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    private var askedLegacyStorage = false
+
+    private val legacyStorage = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { granted ->
+        if (granted.values.all { it } && !VpnRuntime.state.running && !busy) {
+            readConfig(reportError = false)?.let { saveConfig(it) }
+        }
+    }
+
+    private val openKept = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null || isDestroyed) return@registerForActivityResult
+        val kept = try {
+            contentResolver.openInputStream(uri)?.use { stream ->
+                val buffer = ByteArray(4096)
+                val count = stream.read(buffer)
+                if (count <= 0) null else KeptProxy.parse(String(buffer, 0, count, Charsets.UTF_8))
+            }
+        } catch (_: Exception) {
+            null
+        }
+        if (kept == null) {
+            binding.statusText.text = "В файле нет адреса и порта"
+            return@registerForActivityResult
+        }
+        binding.hostInput.setText(kept.host)
+        binding.portInput.setText(kept.port.toString())
+        binding.userInput.setText(kept.username)
+        saveConfig(
+            ProxyConfig(
+                kept.host,
+                kept.port,
+                kept.username,
+                binding.passwordInput.text?.toString().orEmpty(),
+                binding.bypassLan.isChecked,
+            ),
+        )
+        render(VpnRuntime.state)
+        binding.statusText.text = "Адрес и логин восстановлены. Пароль введите заново, если поле пустое."
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         val config = Prefs.load(this)
-        binding.hostInput.setText(config.host)
-        if (config.port in 1..65535) binding.portInput.setText(config.port.toString())
-        binding.userInput.setText(config.username)
+        val recalled = if (config.host.isEmpty()) KeptProxy.read(this) else null
+        val host = recalled?.host ?: config.host
+        val port = recalled?.port ?: config.port
+        val username = recalled?.username ?: config.username
+        binding.hostInput.setText(host)
+        if (port in 1..65535) binding.portInput.setText(port.toString())
+        binding.userInput.setText(username)
         binding.passwordInput.setText(config.password)
         binding.bypassLan.isChecked = config.bypassLan
+        if (recalled != null) {
+            Prefs.save(
+                this,
+                ProxyConfig(host, port, username, config.password, config.bypassLan),
+            )
+        }
 
         binding.connectButton.setOnClickListener { onConnectClicked() }
         binding.testButton.setOnClickListener { onTestClicked() }
         binding.batteryButton.setOnClickListener { askBattery() }
+        binding.restoreButton.setOnClickListener {
+            if (VpnRuntime.state.running || busy) return@setOnClickListener
+            openKept.launch(arrayOf("*/*"))
+        }
 
         if (Build.VERSION.SDK_INT >= 33) {
             notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -66,6 +121,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        if (!VpnRuntime.state.running && !busy) {
+            readConfig(reportError = false)?.let { saveConfig(it) }
+        }
         if (VpnRuntime.listener === listener) VpnRuntime.listener = null
         super.onStop()
     }
@@ -76,7 +134,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val config = readConfig() ?: return
-        Prefs.save(this, config)
+        saveConfig(config)
         busy = true
         render(VpnRuntime.state)
         val prepare = VpnService.prepare(this)
@@ -99,7 +157,7 @@ class MainActivity : AppCompatActivity() {
     private fun onTestClicked() {
         if (VpnRuntime.state.running) return
         val config = readConfig() ?: return
-        Prefs.save(this, config)
+        saveConfig(config)
         busy = true
         binding.statusText.text = "Проверка прокси…"
         render(VpnRuntime.state)
@@ -151,7 +209,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun readConfig(): ProxyConfig? {
+    private fun readConfig(reportError: Boolean = true): ProxyConfig? {
         val host = binding.hostInput.text?.toString()?.trim().orEmpty()
         val portText = binding.portInput.text?.toString()?.trim().orEmpty()
         val user = binding.userInput.text?.toString()?.trim().orEmpty()
@@ -165,7 +223,7 @@ class MainActivity : AppCompatActivity() {
             else -> null
         }
         if (error != null) {
-            binding.statusText.text = error
+            if (reportError) binding.statusText.text = error
             return null
         }
         return ProxyConfig(host, port!!, user, pass, binding.bypassLan.isChecked)
@@ -186,5 +244,15 @@ class MainActivity : AppCompatActivity() {
         binding.passwordInput.isEnabled = editable
         binding.bypassLan.isEnabled = editable
         binding.testButton.isEnabled = editable
+        binding.restoreButton.isEnabled = editable
+    }
+
+    private fun saveConfig(config: ProxyConfig) {
+        Prefs.save(this, config)
+        val missing = KeptProxy.missingLegacyPermissions(this)
+        if (!askedLegacyStorage && missing.isNotEmpty()) {
+            askedLegacyStorage = true
+            legacyStorage.launch(missing)
+        }
     }
 }

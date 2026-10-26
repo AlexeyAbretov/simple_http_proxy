@@ -93,6 +93,20 @@
             android:checked="true"
             android:text="@string/bypass_lan" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/keep_data_hint"
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="?android:attr/textColorSecondary" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/restoreButton"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/restore_kept" />
+
         <com.google.android.material.button.MaterialButton
             android:id="@+id/connectButton"
             android:layout_width="match_parent"
