@@ -2,6 +2,7 @@ package dev.httpvpn.net
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -15,6 +16,7 @@ class TunEngine(
     private val writeTun: (ByteArray) -> Unit,
     private val onError: (String) -> Unit,
     private val trace: (String) -> Unit = {},
+    private val onKeepAwake: (Boolean) -> Unit = {},
 ) {
     val tx = AtomicLong()
     val rx = AtomicLong()
@@ -22,6 +24,7 @@ class TunEngine(
     private val proxyIp = Packets.inet4OrNull(proxy.address)
     private val proxyPort = proxy.port
     private val sessions = ConcurrentHashMap<FlowKey, TcpSession>()
+    private val awakeSessions = AtomicInteger()
     private val dns = DnsRelay(dial)
     private val dnsExec = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "httpvpn-dns").apply { isDaemon = true }
@@ -78,6 +81,7 @@ class TunEngine(
             onError = onError,
             retire = { done -> sessions.remove(key, done) },
             trace = trace,
+            onAwake = ::noteAwake,
         )
         val previous = sessions.putIfAbsent(key, session)
         if (previous != null) {
@@ -97,6 +101,7 @@ class TunEngine(
             val srcPort = udp.srcPort
             dnsExec.execute {
                 if (!running) return@execute
+                noteAwake(true)
                 try {
                     val answer = dns.query(query)
                     if (!running || answer.size !in 12..1400) return@execute
@@ -109,6 +114,8 @@ class TunEngine(
                         onError("DNS: ${e.message ?: "ошибка"}")
                     }
                     trace("dns ${e.message}")
+                } finally {
+                    noteAwake(false)
                 }
             }
             return
@@ -145,6 +152,20 @@ class TunEngine(
                 window = 0,
             ),
         )
+    }
+
+    private fun noteAwake(needed: Boolean) {
+        if (needed) {
+            if (awakeSessions.incrementAndGet() == 1) onKeepAwake(true)
+            return
+        }
+        while (true) {
+            val current = awakeSessions.get()
+            if (current <= 0) return
+            if (!awakeSessions.compareAndSet(current, current - 1)) continue
+            if (current == 1) onKeepAwake(false)
+            return
+        }
     }
 
     private fun safeWrite(packet: ByteArray) {

@@ -23,6 +23,7 @@ class TcpSession(
     private val onError: (String) -> Unit,
     private val retire: (TcpSession) -> Unit,
     private val trace: (String) -> Unit = {},
+    private val onAwake: (Boolean) -> Unit = {},
     private val issSeed: Long? = null,
 ) {
     private val events = LinkedBlockingQueue<Ev>(64)
@@ -45,6 +46,7 @@ class TcpSession(
     private var peerRightEdge = 0L
     private var lastActive = System.nanoTime()
     private var lastProbe = 0L
+    private var awakeHeld = false
     private var upstream: OutputStream? = null
     private var shutdownOut: (() -> Unit)? = null
 
@@ -60,6 +62,7 @@ class TcpSession(
                 }
             } finally {
                 closed = true
+                dropAwake()
                 closeResources()
                 retire(this)
             }
@@ -135,12 +138,16 @@ class TcpSession(
 
     private fun loop() {
         while (!closed) {
-            val first = events.poll(300, TimeUnit.MILLISECONDS)
+            syncAwake()
+            val waitMs = nextWaitMs()
+            val first = if (waitMs <= 0L) {
+                events.poll()
+            } else {
+                events.poll(waitMs, TimeUnit.MILLISECONDS)
+            }
+            if (closed) break
             if (first == null) {
-                if (closed) break
-                retransmit()
-                probeWindow()
-                idleCheck()
+                onTimer()
                 continue
             }
             handle(first)
@@ -148,6 +155,49 @@ class TcpSession(
                 handle(events.poll() ?: break)
             }
         }
+    }
+
+    private fun onTimer() {
+        retransmit()
+        probeWindow()
+        idleCheck()
+    }
+
+    private fun nextWaitMs(): Long {
+        val now = System.nanoTime()
+        var deadline = lastActive + IDLE_NS
+        if (now > deadline) return 0L
+        val seg = unacked.firstOrNull()
+        if (seg != null) {
+            val rtoAt = seg.sentAt + seg.rtoNs
+            if (now >= rtoAt) return 0L
+            if (rtoAt < deadline) deadline = rtoAt
+        }
+        if (needsProbe()) {
+            val probeAt = if (lastProbe == 0L) now else lastProbe + PROBE_NS
+            if (now >= probeAt) return 0L
+            if (probeAt < deadline) deadline = probeAt
+        }
+        val leftNs = deadline - now
+        if (leftNs <= 0L) return 1L
+        return ((leftNs + 999_999L) / 1_000_000L).coerceAtLeast(1L)
+    }
+
+    private fun needsProbe(): Boolean {
+        return established && unacked.isEmpty() && down.size > 0 && sendRoom() <= 0
+    }
+
+    private fun syncAwake() {
+        val needed = !closed && (unacked.isNotEmpty() || needsProbe())
+        if (needed == awakeHeld) return
+        onAwake(needed)
+        awakeHeld = needed
+    }
+
+    private fun dropAwake() {
+        if (!awakeHeld) return
+        awakeHeld = false
+        onAwake(false)
     }
 
     private fun handle(ev: Ev) {
@@ -367,7 +417,7 @@ class TcpSession(
     private fun probeWindow() {
         if (!established || closed || unacked.isNotEmpty() || down.size == 0 || sendRoom() > 0) return
         val now = System.nanoTime()
-        if (now - lastProbe < 1_000_000_000L) return
+        if (lastProbe != 0L && now - lastProbe < PROBE_NS) return
         val byte = down.take(1)
         enqueueSend(TcpFlags.ACK or TcpFlags.PSH, byte, EMPTY, 1)
         lastProbe = now
@@ -426,6 +476,7 @@ class TcpSession(
         const val MSS = 1460
         const val UP_CAP = 256 * 1024
         const val RTO_NS = 400_000_000L
+        const val PROBE_NS = 1_000_000_000L
         const val IDLE_NS = 15L * 60 * 1_000_000_000L
         val EMPTY = ByteArray(0)
         val MSS_OPTION = byteArrayOf(2, 4, 0x05, 0xB4.toByte())

@@ -62,6 +62,27 @@ class TcpSessionTest {
     }
 
     @Test(timeout = 15000)
+    fun retransmitWaitsForRto() {
+        val link = Link()
+        try {
+            link.handshake(clientIsn = 1000)
+            val before = link.packets.size
+            link.serverSend("world".toByteArray())
+            link.waitFor { link.packets.size > before }
+            val sentAt = System.nanoTime()
+            val data = link.tcp(link.packets.last())
+            val marked = link.packets.size
+            link.waitFor {
+                link.packets.size > marked && link.tcp(link.packets.last()).seq == data.seq
+            }
+            val elapsedMs = (System.nanoTime() - sentAt) / 1_000_000
+            assertTrue("повтор слишком рано: ${elapsedMs} мс", elapsedMs >= 200)
+        } finally {
+            link.close()
+        }
+    }
+
+    @Test(timeout = 15000)
     fun pureAckDoesNotEcho() {
         val link = Link()
         try {

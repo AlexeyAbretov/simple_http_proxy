@@ -47,6 +47,12 @@ class HttpVpnService : VpnService() {
     private var worker: Thread? = null
     private var stats: Thread? = null
     private var wake: PowerManager.WakeLock? = null
+    private val wakeGuard = Any()
+    @Volatile private var wakePinnedBySetup = true
+    private var sessionsNeedWake = false
+    private var wakeUntilNs = 0L
+    private var lastNotifAt = 0L
+    private var lastNotifText: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -148,6 +154,7 @@ class HttpVpnService : VpnService() {
                 },
                 writeTun = write@{ packet ->
                     if (stopRequested) return@write
+                    noteActivity()
                     synchronized(writeLock) {
                         val wrote = Os.write(fd, ByteBuffer.wrap(packet))
                         if (wrote != packet.size) Log.w(TAG, "short tun write $wrote/${packet.size}")
@@ -155,6 +162,7 @@ class HttpVpnService : VpnService() {
                 },
                 onError = { message -> lastError = "Последняя ошибка: $message" },
                 trace = { Log.d(TAG, it) },
+                onKeepAwake = ::onSessionsNeedWake,
             )
             engine = localEngine
             stats = thread(isDaemon = true, name = "httpvpn-stats") {
@@ -166,12 +174,13 @@ class HttpVpnService : VpnService() {
                 } catch (_: InterruptedException) {
                 }
             }
-            publishStats(config, localEngine)
+            beginIdleWake()
             val buffer = ByteBuffer.allocate(32767)
             while (!stopRequested) {
                 buffer.clear()
                 val n = Os.read(fd, buffer)
                 if (n <= 0) break
+                noteActivity()
                 localEngine.onPacket(buffer.array(), n)
             }
         } catch (e: Exception) {
@@ -336,8 +345,17 @@ class HttpVpnService : VpnService() {
             }
         }
         VpnRuntime.publish(VpnState(true, tx, rx, text))
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIF_ID, buildNotification("↑ ${formatBytes(tx)}   ↓ ${formatBytes(rx)}"))
+        val notif = "↑ ${formatBytes(tx)}   ↓ ${formatBytes(rx)}"
+        val now = System.currentTimeMillis()
+        val changed = notif != lastNotifText
+        val due = lastNotifAt == 0L || now - lastNotifAt >= NOTIF_INTERVAL_MS
+        if (changed && due) {
+            lastNotifAt = now
+            lastNotifText = notif
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(NOTIF_ID, buildNotification(notif))
+        }
+        releaseWakeIfIdle()
     }
 
     private fun requestStop() {
@@ -391,7 +409,17 @@ class HttpVpnService : VpnService() {
 
     @SuppressLint("WakelockTimeout")
     private fun acquireWake() {
-        if (wake?.isHeld == true) return
+        synchronized(wakeGuard) { acquireWakeLocked() }
+    }
+
+    @SuppressLint("WakelockTimeout")
+    private fun acquireWakeLocked() {
+        if (stopRequested) return
+        val existing = wake
+        if (existing != null) {
+            if (!existing.isHeld) existing.acquire()
+            return
+        }
         val power = getSystemService(POWER_SERVICE) as PowerManager
         wake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "httpvpn:tun").apply {
             setReferenceCounted(false)
@@ -399,7 +427,46 @@ class HttpVpnService : VpnService() {
         }
     }
 
+    private fun beginIdleWake() {
+        synchronized(wakeGuard) {
+            wakePinnedBySetup = false
+            wakeUntilNs = System.nanoTime() + WAKE_HOLD_NS
+            acquireWakeLocked()
+        }
+    }
+
+    private fun noteActivity() {
+        synchronized(wakeGuard) {
+            wakeUntilNs = System.nanoTime() + WAKE_HOLD_NS
+            acquireWakeLocked()
+        }
+    }
+
+    private fun onSessionsNeedWake(needed: Boolean) {
+        synchronized(wakeGuard) {
+            sessionsNeedWake = needed
+            if (needed) acquireWakeLocked()
+        }
+    }
+
+    private fun releaseWakeIfIdle() {
+        synchronized(wakeGuard) {
+            if (wakePinnedBySetup || sessionsNeedWake) return
+            if (System.nanoTime() < wakeUntilNs) return
+            releaseWakeLocked()
+        }
+    }
+
     private fun releaseWake() {
+        synchronized(wakeGuard) {
+            wakePinnedBySetup = false
+            sessionsNeedWake = false
+            wakeUntilNs = 0L
+            releaseWakeLocked()
+        }
+    }
+
+    private fun releaseWakeLocked() {
         try {
             if (wake?.isHeld == true) wake?.release()
         } catch (_: Exception) {
@@ -422,5 +489,7 @@ class HttpVpnService : VpnService() {
         private const val CHANNEL = "vpn"
         private const val NOTIF_ID = 1
         private const val TAG = "HttpVpn"
+        private const val NOTIF_INTERVAL_MS = 15_000L
+        private const val WAKE_HOLD_NS = 10_000_000_000L
     }
 }

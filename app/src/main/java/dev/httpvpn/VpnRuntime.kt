@@ -20,6 +20,9 @@ object VpnRuntime {
 
     fun publish(next: VpnState) {
         state = next
-        main.post { listener?.invoke(next) }
+        val current = listener ?: return
+        main.post {
+            if (listener === current) current.invoke(next)
+        }
     }
 }
