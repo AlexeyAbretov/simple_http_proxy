@@ -53,6 +53,7 @@ class HttpVpnService : VpnService() {
     private var wakeUntilNs = 0L
     private var lastNotifAt = 0L
     private var lastNotifText: String? = null
+    private val notifGuard = Any()
 
     override fun onCreate() {
         super.onCreate()
@@ -70,16 +71,14 @@ class HttpVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) {
+            requestStop()
             stopSelf()
             return START_NOT_STICKY
         }
         when (intent.action) {
             ACTION_STOP -> {
                 requestStop()
-                if (worker?.isAlive != true) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
+                if (worker?.isAlive != true) stopSelf()
                 return START_NOT_STICKY
             }
             else -> {
@@ -91,6 +90,7 @@ class HttpVpnService : VpnService() {
                     foreground("Подключение…")
                 } catch (e: Exception) {
                     releaseWake()
+                    removeNotification()
                     VpnRuntime.publish(VpnState(false, 0, 0, e.message ?: "Не удалось запустить службу"))
                     stopSelf()
                     return START_NOT_STICKY
@@ -104,6 +104,12 @@ class HttpVpnService : VpnService() {
     override fun onRevoke() {
         requestStop()
         super.onRevoke()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        requestStop()
+        if (worker?.isAlive != true) stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
@@ -204,7 +210,7 @@ class HttpVpnService : VpnService() {
             tun = null
             releaseWake()
             stopNetworkWatch()
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+            removeNotification()
             VpnRuntime.publish(VpnState(false, tx, rx, endMessage))
             stopSelf()
         }
@@ -349,11 +355,14 @@ class HttpVpnService : VpnService() {
         val now = System.currentTimeMillis()
         val changed = notif != lastNotifText
         val due = lastNotifAt == 0L || now - lastNotifAt >= NOTIF_INTERVAL_MS
-        if (changed && due) {
+        if (changed && due && !stopRequested) {
             lastNotifAt = now
             lastNotifText = notif
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.notify(NOTIF_ID, buildNotification(notif))
+            try {
+                showNotification(notif)
+            } catch (e: Exception) {
+                if (!stopRequested) Log.w(TAG, "notification", e)
+            }
         }
         releaseWakeIfIdle()
     }
@@ -363,14 +372,35 @@ class HttpVpnService : VpnService() {
         stats?.interrupt()
         try { tun?.close() } catch (_: Exception) {}
         try { engine?.close() } catch (_: Exception) {}
+        removeNotification()
     }
 
     private fun foreground(text: String) {
-        val notification = buildNotification(text)
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIF_ID, notification)
+        showNotification(text)
+    }
+
+    private fun showNotification(text: String) {
+        synchronized(notifGuard) {
+            if (stopRequested) return
+            val notification = buildNotification(text)
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+        }
+    }
+
+    private fun removeNotification() {
+        synchronized(notifGuard) {
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Exception) {
+            }
+            try {
+                getSystemService(NotificationManager::class.java).cancel(NOTIF_ID)
+            } catch (_: Exception) {
+            }
         }
     }
 
