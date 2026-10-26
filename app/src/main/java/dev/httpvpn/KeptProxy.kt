@@ -36,15 +36,27 @@ object KeptProxy {
         if (parse(format(fields)) == null) return
         val body = format(fields).toByteArray(Charsets.UTF_8)
         try {
+            if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
+                writePublicFile(body)
+                return
+            }
             if (Build.VERSION.SDK_INT >= 29) writeMediaStore(context, body) else writeLegacy(context, body)
         } catch (e: Exception) {
             Log.w(TAG, "Не удалось записать файл с адресом прокси: ${e.javaClass.simpleName}")
         }
     }
 
+    fun needsAllFilesAccess(): Boolean {
+        return Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()
+    }
+
     fun read(context: Context): Fields? {
         return try {
-            val text = if (Build.VERSION.SDK_INT >= 29) readMediaStore(context) else readLegacy(context)
+            val text = if (Build.VERSION.SDK_INT >= 29) {
+                readMediaStore(context) ?: readPublicFile()
+            } else {
+                readLegacy(context)
+            }
             text?.let(::parse)
         } catch (e: Exception) {
             Log.w(TAG, "Не удалось прочитать файл с адресом прокси: ${e.javaClass.simpleName}")
@@ -112,6 +124,31 @@ object KeptProxy {
 
     private fun writeLegacy(context: Context, body: ByteArray) {
         if (missingLegacyPermissions(context).isNotEmpty()) return
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (!dir.exists() && !dir.mkdirs()) return
+        File(dir, FILE_NAME).writeBytes(body)
+    }
+
+    private fun readPublicFile(): String? {
+        val dirs = listOf(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            File("/storage/emulated/0/Download"),
+            File("/storage/emulated/0/Downloads"),
+        )
+        val seen = HashSet<String>()
+        for (dir in dirs) {
+            if (!seen.add(dir.absolutePath)) continue
+            try {
+                val file = File(dir, FILE_NAME)
+                if (!file.isFile) continue
+                return file.inputStream().use(::readLimited)
+            } catch (_: Exception) {
+            }
+        }
+        return null
+    }
+
+    private fun writePublicFile(body: ByteArray) {
         val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         if (!dir.exists() && !dir.mkdirs()) return
         File(dir, FILE_NAME).writeBytes(body)

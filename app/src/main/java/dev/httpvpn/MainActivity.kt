@@ -80,6 +80,22 @@ class MainActivity : AppCompatActivity() {
         binding.statusText.text = "Адрес и логин восстановлены. Пароль введите заново, если поле пустое."
     }
 
+    private var allFilesLaunching = false
+
+    private val allFilesSettings = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        allFilesLaunching = false
+        if (isDestroyed) return@registerForActivityResult
+        if (KeptProxy.needsAllFilesAccess()) {
+            Prefs.setAllFilesDeclined(this, true)
+            binding.statusText.text = "Без доступа к файлам адрес из Загрузок не прочитать"
+            return@registerForActivityResult
+        }
+        Prefs.setAllFilesDeclined(this, false)
+        if (!restoreIfEmpty(showStatus = true)) {
+            binding.statusText.text = "В Загрузках нет файла с адресом"
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -106,7 +122,13 @@ class MainActivity : AppCompatActivity() {
         binding.batteryButton.setOnClickListener { askBattery() }
         binding.restoreButton.setOnClickListener {
             if (VpnRuntime.state.running || busy) return@setOnClickListener
-            openKept.launch(arrayOf("*/*"))
+            Prefs.setAllFilesDeclined(this, false)
+            if (KeptProxy.needsAllFilesAccess()) {
+                binding.statusText.text = "Разрешите доступ к файлам — подставится адрес из Загрузок"
+                launchAllFiles()
+                return@setOnClickListener
+            }
+            if (!restoreIfEmpty(showStatus = true)) openKept.launch(arrayOf("*/*"))
         }
 
         if (Build.VERSION.SDK_INT >= 33) {
@@ -118,6 +140,19 @@ class MainActivity : AppCompatActivity() {
         super.onStart()
         VpnRuntime.listener = listener
         render(VpnRuntime.state)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (isDestroyed || VpnRuntime.state.running || busy || allFilesLaunching) return
+        if (binding.hostInput.text.isNullOrBlank() && restoreIfEmpty(showStatus = true)) return
+        if (binding.hostInput.text.isNullOrBlank()
+            && KeptProxy.needsAllFilesAccess()
+            && !Prefs.allFilesDeclined(this)
+        ) {
+            binding.statusText.text = "Разрешите доступ к файлам — подставится адрес из Загрузок"
+            launchAllFiles()
+        }
     }
 
     override fun onStop() {
@@ -245,6 +280,50 @@ class MainActivity : AppCompatActivity() {
         binding.bypassLan.isEnabled = editable
         binding.testButton.isEnabled = editable
         binding.restoreButton.isEnabled = editable
+    }
+
+    private fun restoreIfEmpty(showStatus: Boolean): Boolean {
+        if (binding.hostInput.text?.isNotBlank() == true) return true
+        val kept = KeptProxy.read(this) ?: return false
+        binding.hostInput.setText(kept.host)
+        binding.portInput.setText(kept.port.toString())
+        binding.userInput.setText(kept.username)
+        saveConfig(
+            ProxyConfig(
+                kept.host,
+                kept.port,
+                kept.username,
+                binding.passwordInput.text?.toString().orEmpty(),
+                binding.bypassLan.isChecked,
+            ),
+        )
+        if (showStatus) {
+            render(VpnRuntime.state)
+            binding.statusText.text = "Адрес и логин восстановлены. Пароль введите заново, если поле пустое."
+        }
+        return true
+    }
+
+    private fun launchAllFiles() {
+        if (Build.VERSION.SDK_INT < 30) {
+            openKept.launch(arrayOf("*/*"))
+            return
+        }
+        allFilesLaunching = true
+        val appSettings = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName"),
+        )
+        try {
+            allFilesSettings.launch(appSettings)
+        } catch (_: Exception) {
+            try {
+                allFilesSettings.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            } catch (_: Exception) {
+                allFilesLaunching = false
+                openKept.launch(arrayOf("*/*"))
+            }
+        }
     }
 
     private fun saveConfig(config: ProxyConfig) {

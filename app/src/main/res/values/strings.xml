@@ -7,8 +7,8 @@
     <string name="user_hint">Логин</string>
     <string name="password_hint">Пароль</string>
     <string name="bypass_lan">Локальная сеть мимо прокси</string>
-    <string name="keep_data_hint">Адрес, порт и логин пишутся в файл «Загрузки/simple-http-proxy.txt» и остаются после удаления. Пароль в файл не входит. Если поля пустые, откройте этот файл.</string>
-    <string name="restore_kept">Открыть сохранённый адрес</string>
+    <string name="keep_data_hint">Адрес, порт и логин лежат в «Загрузки/simple-http-proxy.txt» и остаются после удаления. Чтобы подставить их, разрешите доступ к файлам: читается только этот файл. Пароль в него не входит.</string>
+    <string name="restore_kept">Вернуть адрес из файла</string>
     <string name="connect">Подключить</string>
     <string name="disconnect">Отключить</string>
     <string name="test_proxy">Проверить прокси</string>

@@ -35,4 +35,16 @@ object Prefs {
             .commit()
         KeptProxy.write(context, config.host, config.port, config.username)
     }
+
+    fun allFilesDeclined(context: Context): Boolean {
+        return context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .getBoolean("allFilesDeclined", false)
+    }
+
+    fun setAllFilesDeclined(context: Context, declined: Boolean) {
+        context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("allFilesDeclined", declined)
+            .commit()
+    }
 }
