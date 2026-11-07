@@ -29,6 +29,10 @@ import kotlin.concurrent.thread
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var busy = false
+    private var testing = false
+    private val checkLock = Any()
+    private var checkGeneration = 0
+    private var checkSocket: Socket? = null
     private var profiles = mutableListOf<VpnProfile>()
     private var selectedId: String? = null
     private var bindingProfiles = false
@@ -168,6 +172,11 @@ class MainActivity : AppCompatActivity() {
         super.onStop()
     }
 
+    override fun onDestroy() {
+        if (testing) cancelTest(announce = false)
+        super.onDestroy()
+    }
+
     private fun onConnectClicked() {
         if (VpnRuntime.state.running) {
             startService(Intent(this, HttpVpnService::class.java).setAction(HttpVpnService.ACTION_STOP))
@@ -197,44 +206,94 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onTestClicked() {
-        if (VpnRuntime.state.running) return
+        if (testing) {
+            cancelTest(announce = true)
+            return
+        }
+        if (VpnRuntime.state.running || busy) return
         if (!captureForm()) return
         val id = selectedId ?: return
         persist()
         refreshLabel(id)
         val profile = profiles.first { it.id == id }
+        val generation = synchronized(checkLock) { ++checkGeneration }
+        testing = true
         busy = true
         binding.statusText.text = "Проверка прокси…"
         render(VpnRuntime.state)
-        thread(isDaemon = true) {
-            val message = try {
-                val endpoint = ProxyEndpoint(
-                    InetAddress.getByName(profile.host),
-                    profile.port,
-                    profile.username,
-                    profile.password,
-                )
-                val socket = Socket()
-                try {
-                    HttpCodec.establish(socket, endpoint, "example.com", 443, 10_000)
-                } finally {
-                    socket.close()
-                }
-                "Прокси открыл туннель до example.com:443"
-            } catch (_: UnknownHostException) {
-                "Не удалось найти адрес прокси"
-            } catch (e: Exception) {
-                "Прокси недоступен: ${e.message ?: "ошибка"}"
-            }
+        thread(name = "proxy-check", isDaemon = true) {
+            val message = checkProxy(profile, generation) ?: return@thread
             runOnUiThread {
+                if (isDestroyed || !isCheckCurrent(generation)) return@runOnUiThread
+                testing = false
                 busy = false
-                if (!isDestroyed) {
-                    render(VpnRuntime.state)
-                    binding.statusText.text = message
-                }
+                render(VpnRuntime.state)
+                binding.statusText.text = message
             }
         }
     }
+
+    private fun cancelTest(announce: Boolean) {
+        val socket = synchronized(checkLock) {
+            checkGeneration++
+            val current = checkSocket
+            checkSocket = null
+            current
+        }
+        try {
+            socket?.close()
+        } catch (_: Exception) {
+        }
+        testing = false
+        busy = false
+        if (isDestroyed) return
+        render(VpnRuntime.state)
+        if (announce) binding.statusText.text = "Проверка прекращена"
+    }
+
+    private fun checkProxy(profile: VpnProfile, generation: Int): String? {
+        return try {
+            val endpoint = ProxyEndpoint(
+                InetAddress.getByName(profile.host),
+                profile.port,
+                profile.username,
+                profile.password,
+            )
+            if (!isCheckCurrent(generation)) return null
+            val socket = Socket()
+            val started = synchronized(checkLock) {
+                if (generation != checkGeneration) {
+                    false
+                } else {
+                    checkSocket = socket
+                    true
+                }
+            }
+            if (!started) {
+                socket.close()
+                return null
+            }
+            try {
+                HttpCodec.establish(socket, endpoint, "example.com", 443, 10_000)
+            } finally {
+                try {
+                    socket.close()
+                } catch (_: Exception) {
+                }
+                synchronized(checkLock) {
+                    if (checkSocket === socket) checkSocket = null
+                }
+            }
+            if (isCheckCurrent(generation)) "Прокси открыл туннель до example.com:443" else null
+        } catch (_: UnknownHostException) {
+            if (isCheckCurrent(generation)) "Не удалось найти адрес прокси" else null
+        } catch (e: Exception) {
+            if (isCheckCurrent(generation)) "Прокси недоступен: ${e.message ?: "ошибка"}" else null
+        }
+    }
+
+    private fun isCheckCurrent(generation: Int): Boolean =
+        synchronized(checkLock) { generation == checkGeneration }
 
     private fun askBattery() {
         val power = getSystemService(POWER_SERVICE) as PowerManager
@@ -383,6 +442,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render(state: VpnState) {
+        if (testing && state.running) {
+            cancelTest(announce = false)
+            return
+        }
         binding.connectButton.text = getString(if (state.running) R.string.disconnect else R.string.connect)
         if (!busy) binding.statusText.text = state.message
         binding.connectButton.isEnabled = !busy
@@ -393,7 +456,9 @@ class MainActivity : AppCompatActivity() {
         binding.userInput.isEnabled = formEnabled
         binding.passwordInput.isEnabled = formEnabled
         binding.bypassLan.isEnabled = formEnabled
-        binding.testButton.isEnabled = formEnabled
+        val checking = testing && !state.running
+        binding.testButton.isEnabled = formEnabled || checking
+        binding.testButton.text = getString(if (checking) R.string.stop_test else R.string.test_proxy)
         binding.restoreButton.isEnabled = editable
         binding.addProfile.isEnabled = editable
         binding.deleteProfile.isEnabled = editable && selectedId != null
