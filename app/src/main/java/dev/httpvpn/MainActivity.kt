@@ -8,20 +8,31 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.TextUtils
+import android.view.View
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.radiobutton.MaterialRadioButton
 import dev.httpvpn.databinding.ActivityMainBinding
 import dev.httpvpn.net.HttpCodec
 import dev.httpvpn.net.ProxyEndpoint
 import java.net.InetAddress
 import java.net.Socket
 import java.net.UnknownHostException
+import java.util.UUID
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var busy = false
+    private var profiles = mutableListOf<VpnProfile>()
+    private var selectedId: String? = null
+    private var bindingProfiles = false
+    private var hadValidStored = false
 
     private val listener: (VpnState) -> Unit = { state ->
         if (!isDestroyed) render(state)
@@ -45,7 +56,8 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { granted ->
         if (granted.values.all { it } && !VpnRuntime.state.running && !busy) {
-            readConfig(reportError = false)?.let { saveConfig(it) }
+            if (selectedId != null && !formIsBlank()) captureForm(reportError = false)
+            persist()
         }
     }
 
@@ -53,31 +65,18 @@ class MainActivity : AppCompatActivity() {
         if (uri == null || isDestroyed) return@registerForActivityResult
         val kept = try {
             contentResolver.openInputStream(uri)?.use { stream ->
-                val buffer = ByteArray(4096)
-                val count = stream.read(buffer)
-                if (count <= 0) null else KeptProxy.parse(String(buffer, 0, count, Charsets.UTF_8))
+                KeptProfiles.parse(KeptProfiles.readAtMost(stream))
             }
         } catch (_: Exception) {
             null
         }
-        if (kept == null) {
-            binding.statusText.text = "В файле нет адреса и порта"
+        if (kept == null || kept.profiles.isEmpty()) {
+            binding.statusText.text = getString(R.string.kept_bad_file)
             return@registerForActivityResult
         }
-        binding.hostInput.setText(kept.host)
-        binding.portInput.setText(kept.port.toString())
-        binding.userInput.setText(kept.username)
-        saveConfig(
-            ProxyConfig(
-                kept.host,
-                kept.port,
-                kept.username,
-                binding.passwordInput.text?.toString().orEmpty(),
-                binding.bypassLan.isChecked,
-            ),
-        )
-        render(VpnRuntime.state)
-        binding.statusText.text = "Адрес и логин восстановлены. Пароль введите заново, если поле пустое."
+        replaceFromKept(kept)
+        persist()
+        showImported()
     }
 
     private var allFilesLaunching = false
@@ -87,12 +86,14 @@ class MainActivity : AppCompatActivity() {
         if (isDestroyed) return@registerForActivityResult
         if (KeptProxy.needsAllFilesAccess()) {
             Prefs.setAllFilesDeclined(this, true)
-            binding.statusText.text = "Без доступа к файлам адрес из Загрузок не прочитать"
+            binding.statusText.text = getString(R.string.kept_access_denied)
             return@registerForActivityResult
         }
         Prefs.setAllFilesDeclined(this, false)
-        if (!restoreIfEmpty(showStatus = true)) {
-            binding.statusText.text = "В Загрузках нет файла с адресом"
+        if (importFromFile()) {
+            showImported()
+        } else {
+            binding.statusText.text = getString(R.string.kept_missing)
         }
     }
 
@@ -100,36 +101,29 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        val config = Prefs.load(this)
-        val recalled = if (config.host.isEmpty()) KeptProxy.read(this) else null
-        val host = recalled?.host ?: config.host
-        val port = recalled?.port ?: config.port
-        val username = recalled?.username ?: config.username
-        binding.hostInput.setText(host)
-        if (port in 1..65535) binding.portInput.setText(port.toString())
-        binding.userInput.setText(username)
-        binding.passwordInput.setText(config.password)
-        binding.bypassLan.isChecked = config.bypassLan
-        if (recalled != null) {
-            Prefs.save(
-                this,
-                ProxyConfig(host, port, username, config.password, config.bypassLan),
-            )
-        }
 
+        binding.profileList.setOnCheckedChangeListener { group, checkedId -> onProfileChecked(group, checkedId) }
+        binding.addProfile.setOnClickListener { onAdd() }
+        binding.deleteProfile.setOnClickListener { confirmDelete() }
         binding.connectButton.setOnClickListener { onConnectClicked() }
         binding.testButton.setOnClickListener { onTestClicked() }
         binding.batteryButton.setOnClickListener { askBattery() }
-        binding.restoreButton.setOnClickListener {
-            if (VpnRuntime.state.running || busy) return@setOnClickListener
-            Prefs.setAllFilesDeclined(this, false)
-            if (KeptProxy.needsAllFilesAccess()) {
-                binding.statusText.text = "Разрешите доступ к файлам — подставится адрес из Загрузок"
-                launchAllFiles()
-                return@setOnClickListener
-            }
-            if (!restoreIfEmpty(showStatus = true)) openKept.launch(arrayOf("*/*"))
+        binding.restoreButton.setOnClickListener { onRestoreClicked() }
+
+        val loaded = Prefs.loadStore(this)
+        profiles = loaded.profiles.toMutableList()
+        selectedId = loaded.selectedId
+        hadValidStored = profiles.any(::isValid)
+        if (!loaded.stored) importFromFile()
+        if (profiles.isEmpty()) {
+            val id = UUID.randomUUID().toString()
+            profiles.add(VpnProfile(id, "", 0, "", "", true))
+            selectedId = id
+        } else if (loaded.stored && hadValidStored) {
+            persist()
         }
+        bindProfiles()
+        showSelected()
 
         if (Build.VERSION.SDK_INT >= 33) {
             notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -145,19 +139,30 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         if (isDestroyed || VpnRuntime.state.running || busy || allFilesLaunching) return
-        if (binding.hostInput.text.isNullOrBlank() && restoreIfEmpty(showStatus = true)) return
-        if (binding.hostInput.text.isNullOrBlank()
-            && KeptProxy.needsAllFilesAccess()
-            && !Prefs.allFilesDeclined(this)
-        ) {
-            binding.statusText.text = "Разрешите доступ к файлам — подставится адрес из Загрузок"
+        if (Prefs.hasStoredProfiles(this) || profiles.any(::isValid)) return
+        if (KeptProxy.needsAllFilesAccess() && !Prefs.allFilesDeclined(this)) {
+            binding.statusText.text = getString(R.string.kept_need_access)
             launchAllFiles()
+            return
         }
+        if (importFromFile()) showImported()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        val id = selectedId
+        if (!VpnRuntime.state.running && !busy && id != null && !formIsBlank()) {
+            if (captureForm(reportError = false)) persist()
+        }
+        super.onSaveInstanceState(outState)
     }
 
     override fun onStop() {
-        if (!VpnRuntime.state.running && !busy) {
-            readConfig(reportError = false)?.let { saveConfig(it) }
+        val id = selectedId
+        if (!VpnRuntime.state.running && !busy && id != null && !formIsBlank()) {
+            if (captureForm(reportError = false)) {
+                persist()
+                refreshLabel(id)
+            }
         }
         if (VpnRuntime.listener === listener) VpnRuntime.listener = null
         super.onStop()
@@ -168,8 +173,10 @@ class MainActivity : AppCompatActivity() {
             startService(Intent(this, HttpVpnService::class.java).setAction(HttpVpnService.ACTION_STOP))
             return
         }
-        val config = readConfig() ?: return
-        saveConfig(config)
+        if (!captureForm()) return
+        val id = selectedId ?: return
+        persist()
+        refreshLabel(id)
         busy = true
         render(VpnRuntime.state)
         val prepare = VpnService.prepare(this)
@@ -191,18 +198,21 @@ class MainActivity : AppCompatActivity() {
 
     private fun onTestClicked() {
         if (VpnRuntime.state.running) return
-        val config = readConfig() ?: return
-        saveConfig(config)
+        if (!captureForm()) return
+        val id = selectedId ?: return
+        persist()
+        refreshLabel(id)
+        val profile = profiles.first { it.id == id }
         busy = true
         binding.statusText.text = "Проверка прокси…"
         render(VpnRuntime.state)
         thread(isDaemon = true) {
             val message = try {
                 val endpoint = ProxyEndpoint(
-                    InetAddress.getByName(config.host),
-                    config.port,
-                    config.username,
-                    config.password,
+                    InetAddress.getByName(profile.host),
+                    profile.port,
+                    profile.username,
+                    profile.password,
                 )
                 val socket = Socket()
                 try {
@@ -244,7 +254,108 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun readConfig(reportError: Boolean = true): ProxyConfig? {
+    private fun onAdd() {
+        if (VpnRuntime.state.running || busy) return
+        if (profiles.size >= MAX_VPN_PROFILES) {
+            binding.statusText.text = getString(R.string.profiles_limit)
+            return
+        }
+        val current = profiles.firstOrNull { it.id == selectedId }
+        if (current != null && current.host.isEmpty() && formIsBlank()) {
+            binding.statusText.text = getString(R.string.fill_current)
+            return
+        }
+        if (current != null && !captureForm()) return
+        val id = UUID.randomUUID().toString()
+        profiles.add(VpnProfile(id, "", 0, "", "", true))
+        selectedId = id
+        persist()
+        bindProfiles()
+        showSelected()
+        render(VpnRuntime.state)
+    }
+
+    private fun confirmDelete() {
+        if (VpnRuntime.state.running || busy) return
+        val removeId = selectedId ?: return
+        MaterialAlertDialogBuilder(this)
+            .setMessage(R.string.delete_profile_confirm)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.delete_profile) { _, _ ->
+                if (!isDestroyed && !VpnRuntime.state.running && !busy) deleteProfile(removeId)
+            }
+            .show()
+    }
+
+    private fun deleteProfile(removeId: String) {
+        val index = profiles.indexOfFirst { it.id == removeId }
+        if (index < 0) return
+        profiles.removeAt(index)
+        selectedId = when {
+            profiles.isEmpty() -> null
+            index <= profiles.lastIndex -> profiles[index].id
+            else -> profiles.last().id
+        }
+        persist(clearKeptIfEmpty = profiles.none(::isValid))
+        bindProfiles()
+        showSelected()
+        render(VpnRuntime.state)
+    }
+
+    private fun onProfileChecked(group: RadioGroup, checkedId: Int) {
+        if (bindingProfiles || checkedId == View.NO_ID) return
+        val newId = group.findViewById<View>(checkedId)?.tag as? String ?: return
+        if (newId == selectedId) return
+        if (VpnRuntime.state.running || busy) {
+            revertSelection()
+            return
+        }
+        val current = profiles.firstOrNull { it.id == selectedId }
+        if (current != null && current.host.isEmpty() && formIsBlank()) {
+            profiles.removeAll { it.id == current.id }
+            selectedId = newId
+            persist()
+            binding.profileList.post {
+                if (isDestroyed) return@post
+                bindProfiles()
+                showSelected()
+                render(VpnRuntime.state)
+            }
+            return
+        }
+        if (!captureForm()) {
+            revertSelection()
+            return
+        }
+        val previousId = selectedId
+        selectedId = newId
+        persist()
+        if (previousId != null) refreshLabel(previousId)
+        showSelected()
+        render(VpnRuntime.state)
+    }
+
+    private fun onRestoreClicked() {
+        if (VpnRuntime.state.running || busy) return
+        Prefs.setAllFilesDeclined(this, false)
+        if (KeptProxy.needsAllFilesAccess()) {
+            binding.statusText.text = getString(R.string.kept_need_access)
+            launchAllFiles()
+            return
+        }
+        if (importFromFile()) {
+            showImported()
+        } else {
+            openKept.launch(arrayOf("*/*"))
+        }
+    }
+
+    private fun captureForm(reportError: Boolean = true): Boolean {
+        val index = profiles.indexOfFirst { it.id == selectedId }
+        if (index < 0) {
+            if (reportError) binding.statusText.text = getString(R.string.add_profile_first)
+            return false
+        }
         val host = binding.hostInput.text?.toString()?.trim().orEmpty()
         val portText = binding.portInput.text?.toString()?.trim().orEmpty()
         val user = binding.userInput.text?.toString()?.trim().orEmpty()
@@ -252,56 +363,204 @@ class MainActivity : AppCompatActivity() {
         val port = portText.toIntOrNull()
         val error = when {
             host.isEmpty() -> "Укажите адрес прокси"
-            host.any { it.isWhitespace() || it == '/' || it == '\\' || it == ':' } ->
-                "Адрес без порта. Порт введите в отдельное поле"
+            !KeptProfiles.acceptableHost(host) -> "Адрес без порта. Порт введите в отдельное поле"
             port == null || port !in 1..65535 -> "Порт от 1 до 65535"
             else -> null
         }
         if (error != null) {
             if (reportError) binding.statusText.text = error
-            return null
+            return false
         }
-        return ProxyConfig(host, port!!, user, pass, binding.bypassLan.isChecked)
+        val resolvedPort = port ?: return false
+        profiles[index] = profiles[index].copy(
+            host = host,
+            port = resolvedPort,
+            username = user,
+            password = pass,
+            bypassLan = binding.bypassLan.isChecked,
+        )
+        return true
     }
 
     private fun render(state: VpnState) {
-        if (state.running || busy) {
-            binding.connectButton.text = getString(if (state.running) R.string.disconnect else R.string.connect)
-        } else {
-            binding.connectButton.text = getString(R.string.connect)
-        }
+        binding.connectButton.text = getString(if (state.running) R.string.disconnect else R.string.connect)
         if (!busy) binding.statusText.text = state.message
         binding.connectButton.isEnabled = !busy
         val editable = !state.running && !busy
-        binding.hostInput.isEnabled = editable
-        binding.portInput.isEnabled = editable
-        binding.userInput.isEnabled = editable
-        binding.passwordInput.isEnabled = editable
-        binding.bypassLan.isEnabled = editable
-        binding.testButton.isEnabled = editable
+        val formEnabled = editable && selectedId != null
+        binding.hostInput.isEnabled = formEnabled
+        binding.portInput.isEnabled = formEnabled
+        binding.userInput.isEnabled = formEnabled
+        binding.passwordInput.isEnabled = formEnabled
+        binding.bypassLan.isEnabled = formEnabled
+        binding.testButton.isEnabled = formEnabled
         binding.restoreButton.isEnabled = editable
+        binding.addProfile.isEnabled = editable
+        binding.deleteProfile.isEnabled = editable && selectedId != null
+        binding.profileList.isEnabled = editable
+        for (i in 0 until binding.profileList.childCount) {
+            binding.profileList.getChildAt(i).isEnabled = editable
+        }
     }
 
-    private fun restoreIfEmpty(showStatus: Boolean): Boolean {
-        if (binding.hostInput.text?.isNotBlank() == true) return true
-        val kept = KeptProxy.read(this) ?: return false
-        binding.hostInput.setText(kept.host)
-        binding.portInput.setText(kept.port.toString())
-        binding.userInput.setText(kept.username)
-        saveConfig(
-            ProxyConfig(
-                kept.host,
-                kept.port,
-                kept.username,
-                binding.passwordInput.text?.toString().orEmpty(),
-                binding.bypassLan.isChecked,
-            ),
-        )
-        if (showStatus) {
-            render(VpnRuntime.state)
-            binding.statusText.text = "Адрес и логин восстановлены. Пароль введите заново, если поле пустое."
+    private fun formIsBlank(): Boolean {
+        return binding.hostInput.text.isNullOrBlank() &&
+            binding.portInput.text.isNullOrBlank() &&
+            binding.userInput.text.isNullOrBlank() &&
+            binding.passwordInput.text.isNullOrEmpty()
+    }
+
+    private fun isValid(profile: VpnProfile): Boolean {
+        return KeptProfiles.acceptableHost(profile.host) && profile.port in 1..65535
+    }
+
+    private fun profileLabel(profile: VpnProfile): String {
+        if (!isValid(profile)) return getString(R.string.new_profile)
+        return if (profile.username.isEmpty()) {
+            "${profile.host}:${profile.port}"
+        } else {
+            "${profile.host}:${profile.port} (${profile.username})"
         }
+    }
+
+    private fun bindProfiles() {
+        bindingProfiles = true
+        try {
+            binding.profileList.removeAllViews()
+            var checkedId = View.NO_ID
+            for (profile in profiles) {
+                val radio = MaterialRadioButton(this)
+                radio.id = View.generateViewId()
+                radio.tag = profile.id
+                radio.text = profileLabel(profile)
+                radio.maxLines = 2
+                radio.ellipsize = TextUtils.TruncateAt.END
+                radio.layoutParams = RadioGroup.LayoutParams(
+                    RadioGroup.LayoutParams.MATCH_PARENT,
+                    RadioGroup.LayoutParams.WRAP_CONTENT,
+                )
+                binding.profileList.addView(radio)
+                if (profile.id == selectedId) checkedId = radio.id
+            }
+            if (checkedId != View.NO_ID) binding.profileList.check(checkedId)
+        } finally {
+            bindingProfiles = false
+        }
+    }
+
+    private fun refreshLabel(id: String) {
+        val profile = profiles.firstOrNull { it.id == id } ?: return
+        val label = profileLabel(profile)
+        for (i in 0 until binding.profileList.childCount) {
+            val child = binding.profileList.getChildAt(i)
+            if (child.tag == id && child is RadioButton) child.text = label
+        }
+    }
+
+    private fun revertSelection() {
+        bindingProfiles = true
+        try {
+            val radio = (0 until binding.profileList.childCount)
+                .map { binding.profileList.getChildAt(it) }
+                .firstOrNull { it.tag == selectedId }
+            if (radio != null) binding.profileList.check(radio.id) else binding.profileList.clearCheck()
+        } finally {
+            bindingProfiles = false
+        }
+    }
+
+    private fun showSelected() {
+        val profile = profiles.firstOrNull { it.id == selectedId }
+        if (profile == null) {
+            binding.hostInput.setText("")
+            binding.portInput.setText("")
+            binding.userInput.setText("")
+            binding.passwordInput.setText("")
+            binding.bypassLan.isChecked = true
+            return
+        }
+        binding.hostInput.setText(profile.host)
+        binding.portInput.setText(if (profile.port in 1..65535) profile.port.toString() else "")
+        binding.userInput.setText(profile.username)
+        binding.passwordInput.setText(profile.password)
+        binding.bypassLan.isChecked = profile.bypassLan
+    }
+
+    private fun importFromFile(): Boolean {
+        val kept = KeptProxy.read(this) ?: return false
+        if (kept.profiles.isEmpty()) return false
+        replaceFromKept(kept)
+        persist()
         return true
+    }
+
+    private fun showImported() {
+        bindProfiles()
+        showSelected()
+        render(VpnRuntime.state)
+        binding.statusText.text = getString(R.string.kept_restored)
+    }
+
+    private fun replaceFromKept(snapshot: KeptProfiles.Snapshot) {
+        val passwordsById = profiles.associate { it.id to it.password }
+        val passwordsByKey = profiles.groupBy { Triple(it.host, it.port, it.username) }
+        val next = snapshot.profiles.map { item ->
+            val id = item.id.ifBlank { UUID.randomUUID().toString() }
+            val password = if (item.id.isNotBlank() && passwordsById.containsKey(item.id)) {
+                passwordsById.getValue(item.id)
+            } else {
+                passwordsByKey[Triple(item.host, item.port, item.username)]?.singleOrNull()?.password.orEmpty()
+            }
+            VpnProfile(id, item.host, item.port, item.username, password, item.bypassLan)
+        }
+        profiles = next.toMutableList()
+        selectedId = next.firstOrNull { it.id == snapshot.selectedId }?.id ?: next.firstOrNull()?.id
+    }
+
+    private fun validSnapshot(): KeptProfiles.Snapshot {
+        val kept = ArrayList<KeptProfiles.Profile>()
+        for (profile in profiles) {
+            if (!isValid(profile)) continue
+            kept.add(
+                KeptProfiles.Profile(
+                    id = profile.id,
+                    host = profile.host,
+                    port = profile.port,
+                    username = profile.username.replace("\r", "").replace("\n", "").trim(),
+                    bypassLan = profile.bypassLan,
+                ),
+            )
+            if (kept.size == MAX_VPN_PROFILES) break
+        }
+        val selected = kept.firstOrNull { it.id == selectedId }?.id ?: kept.firstOrNull()?.id.orEmpty()
+        return KeptProfiles.Snapshot(kept, selected)
+    }
+
+    /**
+     * Пустой черновик до первой успешной записи не должен создавать хранилище
+     * и затирать файл в «Загрузках»: новая установка ещё может его прочитать.
+     */
+    private fun persist(clearKeptIfEmpty: Boolean = false) {
+        val kept = validSnapshot()
+        val known = hadValidStored || Prefs.hasStoredProfiles(this)
+        if (kept.profiles.isEmpty() && !known) return
+        Prefs.saveStore(this, profiles.toList(), selectedId)
+        if (kept.profiles.isNotEmpty()) {
+            KeptProxy.write(this, kept)
+            hadValidStored = true
+            requestLegacyStorage()
+        } else if (clearKeptIfEmpty && hadValidStored) {
+            KeptProxy.write(this, kept)
+            requestLegacyStorage()
+        }
+    }
+
+    private fun requestLegacyStorage() {
+        val missing = KeptProxy.missingLegacyPermissions(this)
+        if (!askedLegacyStorage && missing.isNotEmpty()) {
+            askedLegacyStorage = true
+            legacyStorage.launch(missing)
+        }
     }
 
     private fun launchAllFiles() {
@@ -323,15 +582,6 @@ class MainActivity : AppCompatActivity() {
                 allFilesLaunching = false
                 openKept.launch(arrayOf("*/*"))
             }
-        }
-    }
-
-    private fun saveConfig(config: ProxyConfig) {
-        Prefs.save(this, config)
-        val missing = KeptProxy.missingLegacyPermissions(this)
-        if (!askedLegacyStorage && missing.isNotEmpty()) {
-            askedLegacyStorage = true
-            legacyStorage.launch(missing)
         }
     }
 }

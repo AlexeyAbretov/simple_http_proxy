@@ -18,8 +18,8 @@
 | `core/src/main/kotlin/dev/httpvpn/net/Tunnel.kt` | `Tunnel`, `TunnelFactory`, `TcpDial` |
 | `app/src/main/java/dev/httpvpn/HttpVpnService.kt` | TUN, сокеты мимо VPN, уведомление |
 | `app/src/main/java/dev/httpvpn/MainActivity.kt` | Экран |
-| `app/src/main/java/dev/httpvpn/Prefs.kt` | Настройки прокси |
-| `app/src/main/java/dev/httpvpn/KeptProxy.kt` | Хост, порт и логин в файле «Загрузки» |
+| `app/src/main/java/dev/httpvpn/Prefs.kt` | Список профилей прокси |
+| `app/src/main/java/dev/httpvpn/KeptProxy.kt` | Список профилей без пароля в файле «Загрузки» |
 | `app/src/main/java/dev/httpvpn/VpnRuntime.kt` | Снимок состояния для UI |
 | `app/build.gradle.kts` | `versionCode`, `versionName`, имя APK |
 

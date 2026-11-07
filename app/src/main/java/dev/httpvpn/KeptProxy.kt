@@ -10,16 +10,13 @@ import android.provider.MediaStore
 import android.util.Log
 import androidx.core.content.ContextCompat
 import java.io.File
-import java.io.InputStream
 
 /**
- * Хост, порт и логин в «Загрузках». Файл не входит в каталог приложения,
+ * Список профилей в «Загрузках». Файл не входит в каталог приложения,
  * поэтому удаление через настройки его не стирает. Пароль сюда не пишется.
  */
 object KeptProxy {
     const val FILE_NAME = "simple-http-proxy.txt"
-
-    data class Fields(val host: String, val port: Int, val username: String)
 
     fun missingLegacyPermissions(context: Context): Array<String> {
         if (Build.VERSION.SDK_INT >= 29) return emptyArray()
@@ -31,10 +28,12 @@ object KeptProxy {
         }.toTypedArray()
     }
 
-    fun write(context: Context, host: String, port: Int, username: String) {
-        val fields = Fields(host, port, username.replace("\r", "").replace("\n", ""))
-        if (parse(format(fields)) == null) return
-        val body = format(fields).toByteArray(Charsets.UTF_8)
+    fun write(context: Context, snapshot: KeptProfiles.Snapshot) {
+        if (!KeptProfiles.roundTrips(snapshot)) {
+            Log.w(TAG, "Список прокси не записан: файл не совпал бы при чтении")
+            return
+        }
+        val body = KeptProfiles.format(snapshot).toByteArray(Charsets.UTF_8)
         try {
             if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
                 writePublicFile(body)
@@ -42,7 +41,7 @@ object KeptProxy {
             }
             if (Build.VERSION.SDK_INT >= 29) writeMediaStore(context, body) else writeLegacy(context, body)
         } catch (e: Exception) {
-            Log.w(TAG, "Не удалось записать файл с адресом прокси: ${e.javaClass.simpleName}")
+            Log.w(TAG, "Не удалось записать список прокси: ${e.javaClass.simpleName}")
         }
     }
 
@@ -50,32 +49,19 @@ object KeptProxy {
         return Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()
     }
 
-    fun read(context: Context): Fields? {
+    fun read(context: Context): KeptProfiles.Snapshot? {
         return try {
             val text = if (Build.VERSION.SDK_INT >= 29) {
                 readMediaStore(context) ?: readPublicFile()
             } else {
                 readLegacy(context)
             }
-            text?.let(::parse)
+            text?.let(KeptProfiles::parse)
         } catch (e: Exception) {
-            Log.w(TAG, "Не удалось прочитать файл с адресом прокси: ${e.javaClass.simpleName}")
+            Log.w(TAG, "Не удалось прочитать список прокси: ${e.javaClass.simpleName}")
             null
         }
     }
-
-    fun parse(text: String): Fields? {
-        val lines = text.replace("\r\n", "\n").replace('\r', '\n').lineSequence().take(3).toList()
-        if (lines.size < 2) return null
-        val host = lines[0].trim()
-        val port = lines[1].trim().toIntOrNull() ?: return null
-        val username = lines.getOrNull(2)?.trim().orEmpty()
-        if (host.isEmpty() || host.any { it.isWhitespace() || it == '/' || it == '\\' || it == ':' }) return null
-        if (port !in 1..65535) return null
-        return Fields(host, port, username)
-    }
-
-    private fun format(fields: Fields): String = "${fields.host}\n${fields.port}\n${fields.username}\n"
 
     private fun writeMediaStore(context: Context, body: ByteArray) {
         val resolver = context.contentResolver
@@ -104,7 +90,7 @@ object KeptProxy {
 
     private fun readMediaStore(context: Context): String? {
         val uri = findOwned(context) ?: return null
-        return context.contentResolver.openInputStream(uri)?.use(::readLimited)
+        return context.contentResolver.openInputStream(uri)?.use(KeptProfiles::readAtMost)
     }
 
     private fun findOwned(context: Context): android.net.Uri? {
@@ -141,7 +127,7 @@ object KeptProxy {
             try {
                 val file = File(dir, FILE_NAME)
                 if (!file.isFile) continue
-                return file.inputStream().use(::readLimited)
+                return file.inputStream().use(KeptProfiles::readAtMost)
             } catch (_: Exception) {
             }
         }
@@ -161,14 +147,7 @@ object KeptProxy {
             FILE_NAME,
         )
         if (!file.isFile) return null
-        return file.inputStream().use(::readLimited)
-    }
-
-    private fun readLimited(input: InputStream): String {
-        val buffer = ByteArray(4096)
-        val count = input.read(buffer)
-        if (count <= 0) return ""
-        return String(buffer, 0, count, Charsets.UTF_8)
+        return file.inputStream().use(KeptProfiles::readAtMost)
     }
 
     private const val TAG = "HttpVpn"
