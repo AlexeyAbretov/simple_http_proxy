@@ -11,8 +11,8 @@ android {
         applicationId = "dev.httpvpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.8"
+        versionCode = 11
+        versionName = "1.10"
     }
 
     buildTypes {

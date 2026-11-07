@@ -413,7 +413,7 @@ class HttpVpnService : VpnService() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(contentIntent())
-            .addAction(0, getString(R.string.disconnect), stopIntent())
+            .addAction(R.drawable.ic_stat_disconnect, getString(R.string.disconnect), stopIntent())
             .build()
     }
 
